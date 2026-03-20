@@ -660,6 +660,7 @@ export class WebCrawler {
       robotsTxt: this.robotsTxt,
       allowExternalContentLinks: this.allowExternalContentLinks,
       allowSubdomains: this.allowSubdomains,
+      allowBackwardCrawling: this.allowBackwardCrawling,
     });
   }
 
