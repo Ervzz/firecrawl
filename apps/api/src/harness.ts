@@ -992,6 +992,63 @@ let serviceError = false;
 async function waitForTermination(services: Services): Promise<void> {
   logger.info("All services running. Press Ctrl+C to stop");
 
+  // NUQ workers are resilient — respawn on crash instead of killing everything.
+  // Only give up after MAX_RESPAWNS consecutive failures within RESPAWN_WINDOW_MS.
+  const MAX_RESPAWNS = 10;
+  const RESPAWN_WINDOW_MS = 60_000;
+  const RESPAWN_DELAY_MS = 2_000;
+
+  function makeResilientNuqWorker(index: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      let consecutiveFailures = 0;
+      let lastFailureTime = 0;
+
+      function spawnWorker() {
+        if (shuttingDown) { resolve(); return; }
+
+        const worker = execForward(
+          `nuq-worker-${index}`,
+          process.argv[2] === "--start-docker"
+            ? "node dist/src/services/worker/nuq-worker.js"
+            : "pnpm nuq-worker:production",
+          {
+            NUQ_WORKER_PORT: String(NUQ_WORKER_START_PORT + index),
+            NUQ_REDUCE_NOISE: "true",
+            NUQ_POD_NAME: `nuq-worker-${index}`,
+          },
+        );
+
+        // Replace the worker in the services array so graceful shutdown can find it
+        services.nuqWorkers[index] = worker;
+
+        worker.promise.then(() => {
+          // Clean exit — we're shutting down
+          resolve();
+        }).catch((error) => {
+          if (shuttingDown) { resolve(); return; }
+
+          const now = Date.now();
+          if (now - lastFailureTime > RESPAWN_WINDOW_MS) {
+            consecutiveFailures = 0; // reset if enough time passed
+          }
+          lastFailureTime = now;
+          consecutiveFailures++;
+
+          if (consecutiveFailures >= MAX_RESPAWNS) {
+            logger.error(`nuq-worker-${index} crashed ${MAX_RESPAWNS} times in ${RESPAWN_WINDOW_MS / 1000}s — giving up`);
+            serviceError = true;
+            resolve(); // let the process shut down
+          } else {
+            logger.warn(`nuq-worker-${index} crashed (${consecutiveFailures}/${MAX_RESPAWNS}), respawning in ${RESPAWN_DELAY_MS}ms...`);
+            setTimeout(spawnWorker, RESPAWN_DELAY_MS);
+          }
+        });
+      }
+
+      spawnWorker();
+    });
+  }
+
   const promises: Promise<void>[] = [
     new Promise<void>(resolve => {
       if (require.main === module) {
@@ -1001,6 +1058,7 @@ async function waitForTermination(services: Services): Promise<void> {
     }),
   ];
 
+  // Critical services — if these die, shut down
   if (services.command) promises.push(services.command.promise);
   if (services.api) promises.push(services.api.promise);
   if (services.worker) promises.push(services.worker.promise);
@@ -1011,7 +1069,10 @@ async function waitForTermination(services: Services): Promise<void> {
   if (services.nuqReconcilerWorker)
     promises.push(services.nuqReconcilerWorker.promise);
 
-  promises.push(...services.nuqWorkers.map(w => w.promise));
+  // NUQ workers — resilient, respawn on crash
+  for (let i = 0; i < services.nuqWorkers.length; i++) {
+    promises.push(makeResilientNuqWorker(i));
+  }
 
   await Promise.race(promises).catch(error => {
     logger.error("A service has terminated unexpectedly", error);
