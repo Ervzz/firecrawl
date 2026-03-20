@@ -651,6 +651,18 @@ export class WebCrawler {
   }
 
   public async filterURL(href: string, url: string): Promise<FilterResult> {
+    // When allowBackwardCrawling is enabled, skip the Rust filterUrl pre-filter
+    // because it has its own backward crawling check that can't be disabled.
+    // The batch filterLinks (which does support allowBackwardCrawling) will
+    // handle final filtering.
+    if (this.allowBackwardCrawling) {
+      try {
+        const resolved = new URL(href, url).href;
+        return { allowed: true, url: resolved };
+      } catch {
+        return { allowed: false };
+      }
+    }
     return await filterUrl({
       href: href,
       url: url,
@@ -660,7 +672,6 @@ export class WebCrawler {
       robotsTxt: this.robotsTxt,
       allowExternalContentLinks: this.allowExternalContentLinks,
       allowSubdomains: this.allowSubdomains,
-      allowBackwardCrawling: this.allowBackwardCrawling,
     });
   }
 
